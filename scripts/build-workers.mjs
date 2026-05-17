@@ -28,14 +28,29 @@ const WORKERS = [
   { name: 'instant-push', outName: 'instant-worker.bundle.js' },
 ];
 
+// CF Workers' `nodejs_compat` layer only resolves the `node:`-prefixed module
+// id, not the bare `crypto`. amsg-instant (and its web-push dep) ship bare
+// imports — without this plugin the deployed bundle throws at startup with
+// `No such module "crypto" imported from "worker.js"` even with the flag
+// enabled. Rewrite every `crypto` / `node:crypto` import to `node:crypto` and
+// keep them external so the runtime supplies them.
+const nodeCryptoExternalPlugin = {
+  name: 'node-crypto-external',
+  setup(build) {
+    build.onResolve({ filter: /^(node:)?crypto$/ }, () => ({
+      path: 'node:crypto',
+      external: true,
+    }));
+  },
+};
+
 const sharedOpts = {
   format: 'esm',
   target: 'es2022',
   platform: 'neutral',
   bundle: true,
   minify: false,
-  // node:crypto / crypto are provided by CF Workers runtime (nodejs_compat flag)
-  external: ['node:crypto', 'crypto'],
+  plugins: [nodeCryptoExternalPlugin],
   conditions: ['worker', 'browser', 'import', 'default'],
 };
 
