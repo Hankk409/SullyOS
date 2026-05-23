@@ -39,9 +39,9 @@ const Chat: React.FC = () => {
         } catch { return 0; }
     }, []);
     const [messages, setMessages] = useState<Message[]>([]);
-    // Instant Push 路径：消息写入 DB 到 POST `/instant` 真正发出之间，气泡显示半透明。
-    // worker 回 200 即从 set 移除——此后用户杀 PWA 也安全。
-    const [pendingInstantMsgIds, setPendingInstantMsgIds] = useState<Set<number>>(new Set());
+    // Instant Push 路径："准备中"三个点 = 消息正在拼接+发送; 消失 = 已 POST 发出 (keepalive,
+    // 杀 PWA 也安全) = 可安全离开. true 从触发置起, onInstantPosted (= fetch dispatch) 置回 false。
+    const [instantSendingActive, setInstantSendingActive] = useState(false);
     const [totalMsgCount, setTotalMsgCount] = useState(0);
     const [visibleCount, setVisibleCount] = useState(30);
     const [windowedFocusMsgId, setWindowedFocusMsgId] = useState<number | null>(null);
@@ -816,21 +816,10 @@ const Chat: React.FC = () => {
         // 否则保留手动 ⚡（避免"启用 instant = 自动回复"的反直觉强绑定）。
         const instantCfg = loadInstantConfig();
         if (type === 'text' && isInstantConfigReady(instantCfg) && instantCfg.autoTriggerOnSend) {
-            // 标记为"准备中"：从写入 DB 到 POST 真正发出之间气泡半透明，
-            // 提示用户先别杀 PWA。worker 收到（200）后回调清除。
-            setPendingInstantMsgIds(prev => {
-                const next = new Set(prev);
-                next.add(savedUserMsgId);
-                return next;
-            });
-            triggerAI(messages, undefined, () => {
-                setPendingInstantMsgIds(prev => {
-                    if (!prev.has(savedUserMsgId)) return prev;
-                    const next = new Set(prev);
-                    next.delete(savedUserMsgId);
-                    return next;
-                });
-            });
+            // 标记"准备中"三个点：拼接+发送期间显示，POST 真正发出 (onInstantPosted) 后清除，
+            // 提示用户此时可安全离开 (杀 PWA 也没事)。
+            setInstantSendingActive(true);
+            triggerAI(messages, undefined, () => setInstantSendingActive(false));
         }
     };
 
@@ -839,26 +828,11 @@ const Chat: React.FC = () => {
     // 与 autoTriggerOnSend 自动路径的指示器行为一致。本地模式无此指示器，直接 triggerAI。
     const handleManualTrigger = () => {
         if (!isInstantConfigReady()) { triggerAI(messages); return; }
-        const trailingUserIds: number[] = [];
-        for (let i = messages.length - 1; i >= 0; i--) {
-            if (messages[i].role === 'assistant') break;
-            if (messages[i].role === 'user') trailingUserIds.push(messages[i].id);
-        }
-        if (trailingUserIds.length > 0) {
-            setPendingInstantMsgIds(prev => {
-                const next = new Set(prev);
-                trailingUserIds.forEach(id => next.add(id));
-                return next;
-            });
-        }
-        triggerAI(messages, undefined, () => {
-            setPendingInstantMsgIds(prev => {
-                if (trailingUserIds.every(id => !prev.has(id))) return prev;
-                const next = new Set(prev);
-                trailingUserIds.forEach(id => next.delete(id));
-                return next;
-            });
-        });
+        // 本地模式无此指示器, 直接 triggerAI; instant 模式置 instantSendingActive=true,
+        // 三个点由 instantSendingUserIds 派生 (按当前 messages 重算尾部 user 消息), POST 发出
+        // (onInstantPosted) 后置 false 清除. 不再快照消息 id, 避免点击瞬间 messages 未更新导致漏显示.
+        setInstantSendingActive(true);
+        triggerAI(messages, undefined, () => setInstantSendingActive(false));
     };
 
     const handleReroll = async () => {
@@ -1856,20 +1830,21 @@ const Chat: React.FC = () => {
 
     const collapsedCount = Math.max(0, totalMsgCount - displayMessages.length);
 
-    // "准备中"三个点: instant 模式下从 isTyping 派生 (触发 → worker 回复落地的整个等待期间),
-    // 给"上一条 assistant 之后的所有 user 消息"显示. 不再只依赖 handleManualTrigger / 自动路径
-    // 点击时快照的 pendingInstantMsgIds —— 那个靠 onDispatched 回调清除, 窗口极短 (fetch 一排进
-    // 网络栈就清) 且依赖点击瞬间 messages 已含新消息, 实测常常根本不显示. 派生值每次渲染按当前
-    // messages + isTyping 重算, 鲁棒可见. 两者 OR, 保留旧 set 作兜底.
-    const instantPendingUserIds = useMemo(() => {
-        if (!isTyping || !isInstantConfigReady()) return EMPTY_NUM_SET;
+    // "准备中"三个点 = "消息正在拼接 + 发送" 的可见信号; 消失 = 已 POST 发出 (带 keepalive,
+    // 杀 PWA 也安全) → 用户可安全离开. 语义必须是 "触发 → POST dispatch" 这一窗口.
+    // 用显式布尔 instantSendingActive (handleManualTrigger / 自动发送路径置 true, onInstantPosted
+    // = onDispatched 置 false), 派生时按当前 messages 重算 "上一条 assistant 之后的所有 user 消息"
+    // —— 不依赖点击瞬间快照 (旧实现快照 trailingUserIds / savedUserMsgId, 易因 messages 未及时
+    // 更新或竞态而集合为空, 实测根本不显示). 每次渲染按最新 messages 算, 鲁棒可见.
+    const instantSendingUserIds = useMemo(() => {
+        if (!instantSendingActive) return EMPTY_NUM_SET;
         const ids = new Set<number>();
         for (let i = messages.length - 1; i >= 0; i--) {
             if (messages[i].role === 'assistant') break;
             if (messages[i].role === 'user') ids.add(messages[i].id);
         }
         return ids;
-    }, [isTyping, messages]);
+    }, [instantSendingActive, messages]);
 
     // Reset active category if it becomes invisible for the current character
     useEffect(() => {
@@ -2375,7 +2350,7 @@ const Chat: React.FC = () => {
                             bubbleVariant={osTheme.chatBubbleStyle}
                             messageSpacing={osTheme.chatMessageSpacing}
                             showTimestamp={osTheme.chatShowTimestamp}
-                            isPending={instantPendingUserIds.has(m.id) || pendingInstantMsgIds.has(m.id)}
+                            isPending={instantSendingUserIds.has(m.id)}
                             pendingIndicator={osTheme.chatPendingIndicator !== false}
                             onMcdSendCart={handleMcdSendCart}
                             onMcdCandidate={handleMcdCandidate}
